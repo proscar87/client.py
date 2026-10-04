@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections import defaultdict
-from dataclasses import dataclass
+from collections import defaultdict, deque
+from dataclasses import asdict, dataclass
 import time
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, patch
 
-from aiohttp import ClientSession, hdrs, web
+from aiohttp import ClientResponseError, ClientSession, hdrs, web
 from aiohttp.test_utils import TestServer
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
@@ -87,7 +87,12 @@ class _FakeEcovacsApi:
 
         if endpoint not in self.responses:
             raise web.HTTPNotFound
-        body = orjson.dumps(self.responses[endpoint])
+        response = self.responses[endpoint]
+        if isinstance(response, deque):
+            response = response.popleft()
+        if isinstance(response, web.StreamResponse):
+            return response
+        body = orjson.dumps(response)
 
         if request.method == hdrs.METH_POST:
             return web.Response(body=body, content_type="application/json")
@@ -558,7 +563,8 @@ async def test_login_stores_and_notifies_account_credentials(
     """A password login stores the account credentials and notifies subscribers."""
     changed: asyncio.Queue[AccountCredentials] = asyncio.Queue()
     auth.subscribe_account_credentials(changed.put)
-    assert auth.account_credentials is None
+    initial_account = auth.account_credentials
+    assert initial_account is None
 
     await auth.authenticate()
 
@@ -576,3 +582,204 @@ async def test_verify_device_stores_account_credentials(auth: Authenticator) -> 
         access_token="access-token",  # noqa: S106
         user_id="user-id",
     )
+
+
+@pytest.mark.parametrize("alpha_2_country", ["US", "IT", "CN"])
+async def test_verified_account_survives_new_authenticator(
+    auth: Authenticator, api: _FakeEcovacsApi, alpha_2_country: str
+) -> None:
+    """Verification credentials survive session replacement and forced refresh."""
+    verification_required = {"code": "1013", "msg": "Device verification required"}
+    api.responses["login"] = api.responses["loginCheckMobile"] = verification_required
+    api.responses["user.do"]["userId"] = "short-user-id"
+
+    with pytest.raises(DeviceVerificationRequiredError):
+        await auth.authenticate()
+    await auth.request_device_verification_code()
+    await auth.verify_device("123456")
+    account = auth.account_credentials
+    assert account is not None
+    assert account.user_id == "user-id"
+    stored = orjson.loads(orjson.dumps(asdict(account)))
+    await auth.teardown()
+
+    async with ClientSession() as new_session:
+        config = create_rest_config(
+            session=new_session,
+            device_id=_DEVICE_ID,
+            alpha_2_country=alpha_2_country,
+            override_rest_url=api.url,
+        )
+        unseeded = Authenticator(config, _ACCOUNT_ID, _PASSWORD_HASH)
+        try:
+            with pytest.raises(DeviceVerificationRequiredError):
+                await unseeded.authenticate()
+        finally:
+            await unseeded.teardown()
+        restored = Authenticator(
+            create_rest_config(
+                session=new_session,
+                device_id=_DEVICE_ID,
+                alpha_2_country=alpha_2_country,
+                override_rest_url=api.url,
+            ),
+            _ACCOUNT_ID,
+            _PASSWORD_HASH,
+            account_credentials=AccountCredentials(**stored),
+        )
+        try:
+            credentials = await restored.authenticate()
+            assert credentials.user_id == "short-user-id"
+            assert credentials.token == "portal-token"  # noqa: S105
+            api.responses["user.do"]["token"] = "refreshed-portal-token"  # noqa: S105
+            assert (
+                await restored.authenticate(force=True)
+            ).token == "refreshed-portal-token"  # noqa: S105
+            assert restored.account_credentials == account
+        finally:
+            await restored.teardown()
+
+    endpoint = "loginCheckMobile" if alpha_2_country == "CN" else "login"
+    assert len(api.requests[endpoint]) == 2
+    assert len(api.requests["sendEmailVerifyCode"]) == 1
+    assert len(api.requests["verifyDevice"]) == 1
+    assert len(api.requests["getAuthCode"]) == 3
+    assert len(api.requests["user.do"]) == 3
+    for request in api.requests["getAuthCode"]:
+        assert request.query["deviceId"] == _DEVICE_ID
+        assert request.query["uid"] == "user-id"
+        assert request.query["accessToken"] == account.access_token
+    for request in api.requests["user.do"]:
+        assert request.json is not None
+        assert request.json["resource"] == _DEVICE_ID
+
+
+async def test_expired_account_is_replaced_after_password_fallback(
+    session: ClientSession, api: _FakeEcovacsApi
+) -> None:
+    """A failed token exchange falls back once and persists the replacement."""
+    api.responses["getAuthCode"] = deque(
+        [
+            {"code": "0004", "msg": "user login expired"},
+            api.responses["getAuthCode"],
+            api.responses["getAuthCode"],
+        ]
+    )
+    auth = Authenticator(
+        create_rest_config(
+            session=session,
+            device_id=_DEVICE_ID,
+            alpha_2_country="IT",
+            override_rest_url=api.url,
+        ),
+        _ACCOUNT_ID,
+        _PASSWORD_HASH,
+        account_credentials=AccountCredentials(
+            access_token="expired",  # noqa: S106
+            user_id="user-id",
+        ),
+    )
+    changed: asyncio.Queue[AccountCredentials] = asyncio.Queue()
+    unsubscribe = auth.subscribe_account_credentials(changed.put)
+    try:
+        assert (await auth.authenticate()).token == "portal-token"  # noqa: S105
+        async with asyncio.timeout(1):
+            account = await changed.get()
+        assert account == auth.account_credentials
+        assert account.access_token == "access-token"  # noqa: S105
+        await auth.authenticate(force=True)
+        assert changed.empty()
+        assert len(api.requests["login"]) == 1
+        assert [r.query["accessToken"] for r in api.requests["getAuthCode"]] == [
+            "expired",
+            "access-token",
+            "access-token",
+        ]
+    finally:
+        unsubscribe()
+        await auth.teardown()
+
+
+async def test_expired_account_preserves_verification_required(
+    session: ClientSession, api: _FakeEcovacsApi
+) -> None:
+    """An expired token must still allow the caller to request verification."""
+    api.responses["getAuthCode"] = {"code": "0004", "msg": "user login expired"}
+    api.responses["login"] = {"code": "1013", "msg": "Device verification required"}
+    auth = Authenticator(
+        create_rest_config(
+            session=session,
+            device_id=_DEVICE_ID,
+            alpha_2_country="IT",
+            override_rest_url=api.url,
+        ),
+        _ACCOUNT_ID,
+        _PASSWORD_HASH,
+        account_credentials=AccountCredentials(
+            access_token="expired",  # noqa: S106
+            user_id="user-id",
+        ),
+    )
+    try:
+        with pytest.raises(DeviceVerificationRequiredError):
+            await auth.authenticate()
+        assert len(api.requests["getAuthCode"]) == 1
+        assert len(api.requests["login"]) == 1
+        assert "verifyDevice" not in api.requests
+        assert "sendEmailVerifyCode" not in api.requests
+        assert "user.do" not in api.requests
+    finally:
+        await auth.teardown()
+
+
+@pytest.mark.parametrize("status", [429, 503])
+async def test_token_exchange_http_error_does_not_fall_back_to_password(
+    session: ClientSession, api: _FakeEcovacsApi, status: int
+) -> None:
+    """A temporary HTTP failure does not turn into another verification request."""
+    api.responses["getAuthCode"] = web.Response(status=status)
+    auth = Authenticator(
+        create_rest_config(
+            session=session,
+            device_id=_DEVICE_ID,
+            alpha_2_country="IT",
+            override_rest_url=api.url,
+        ),
+        _ACCOUNT_ID,
+        _PASSWORD_HASH,
+        account_credentials=AccountCredentials(
+            access_token="access-token",  # noqa: S106
+            user_id="user-id",
+        ),
+    )
+    try:
+        with pytest.raises(ClientResponseError) as exc_info:
+            await auth.authenticate()
+        assert exc_info.value.status == status
+        assert len(api.requests["getAuthCode"]) == 1
+        assert "login" not in api.requests
+        assert "sendEmailVerifyCode" not in api.requests
+    finally:
+        await auth.teardown()
+
+
+async def test_account_subscriber_receives_verification_and_can_unsubscribe(
+    auth: Authenticator, api: _FakeEcovacsApi
+) -> None:
+    """Verification is persisted once and unsubscribe prevents later writes."""
+    changed: asyncio.Queue[AccountCredentials] = asyncio.Queue()
+    unsubscribe = auth.subscribe_account_credentials(changed.put)
+    await auth.verify_device("123456")
+    async with asyncio.timeout(1):
+        assert await changed.get() == auth.account_credentials
+
+    await auth.verify_device("123456")
+    await asyncio.sleep(0)
+    assert changed.empty()
+    unsubscribe()
+    api.responses["verifyDevice"]["data"]["accessToken"] = "replacement-token"
+    await auth.verify_device("123456")
+    await asyncio.sleep(0)
+    assert changed.empty()
+    assert auth.account_credentials is not None
+    assert auth.account_credentials.access_token == "replacement-token"  # noqa: S105
