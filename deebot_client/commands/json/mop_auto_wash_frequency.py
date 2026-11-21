@@ -28,7 +28,8 @@ class GetMopAutoWashFrequency(JsonGetCommand):
 
         :return: A message response
         """
-        event_bus.notify(MopAutoWashFrequencyEvent(int(data["interval"])))
+        if "interval" in data:
+            event_bus.notify(MopAutoWashFrequencyEvent(int(data["interval"])))
         return HandlingResult.success()
 
 
@@ -37,7 +38,7 @@ class SetMopAutoWashFrequency(JsonSetCommand):
 
     NAME = "setWashInfo"
     get_command = GetMopAutoWashFrequency
-    _mqtt_params = MappingProxyType({"interval": InitParam(int)})
+    _mqtt_params = MappingProxyType({"interval": InitParam(int, optional=True)})
 
-    def __init__(self, interval: int) -> None:
-        super().__init__({"interval": interval})
+    def __init__(self, interval: int | None = None) -> None:
+        super().__init__({"interval": interval} if interval is not None else {})

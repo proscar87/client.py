@@ -15,6 +15,7 @@ import pytest
 from deebot_client.commands.json.battery import GetBattery
 from deebot_client.commands.json.volume import SetVolume
 from deebot_client.const import UNDEFINED, DataType, UndefinedType
+from deebot_client.events.mop_auto_wash_frequency import MopAutoWashFrequencyEvent
 from deebot_client.exceptions import AuthenticationError, MqttError
 from deebot_client.mqtt_client import MqttClient, MqttConfiguration, create_mqtt_config
 
@@ -153,6 +154,84 @@ async def test_p2p_success(
         command_object.handle_mqtt_p2p.assert_called_with(events, payload)
         assert request_id not in mqtt_client._received_p2p_commands
         assert len(mqtt_client._received_p2p_commands) == 0
+
+
+@pytest.mark.parametrize(
+    ("data", "expected_interval"),
+    [
+        ({"mode": 3}, None),
+        ({"hot_wash_amount": 2}, None),
+        ({"wiseMode": 1, "interval": 15}, 15),
+    ],
+)
+def test_p2p_set_wash_info_partial(
+    authenticator: Authenticator,
+    caplog: pytest.LogCaptureFixture,
+    data: dict[str, Any],
+    expected_interval: int | None,
+) -> None:
+    """Handle partial wash settings sent by the official app."""
+    client = MqttClient(
+        create_mqtt_config(device_id="test", country="FR"), authenticator
+    )
+    events = Mock()
+    client._subscriptions["did"] = Mock(events=events)
+    request = [
+        "iot",
+        "p2p",
+        "setWashInfo",
+        "app",
+        "app",
+        "app",
+        "did",
+        "k2iwaq",
+        "resource",
+        "q",
+        "req",
+        "j",
+    ]
+    response = [
+        "iot",
+        "p2p",
+        "setWashInfo",
+        "did",
+        "k2iwaq",
+        "resource",
+        "app",
+        "app",
+        "app",
+        "p",
+        "req",
+        "j",
+    ]
+    payload = orjson.dumps(
+        {
+            "body": {"data": data},
+            "header": {
+                "channel": "Android",
+                "m": "request",
+                "pri": 2,
+                "tzc": "Europe/Paris",
+                "tzm": 60,
+                "ver": "0.0.22",
+            },
+        }
+    )
+    client._handle_p2p(request, payload)
+    assert "req" in client._received_p2p_commands
+    client._handle_p2p(response, orjson.dumps({"body": {"code": 0, "msg": "ok"}}))
+    assert "req" not in client._received_p2p_commands
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+    wash_events = [
+        call.args[0]
+        for call in events.notify.call_args_list
+        if isinstance(call.args[0], MopAutoWashFrequencyEvent)
+    ]
+    assert wash_events == (
+        []
+        if expected_interval is None
+        else [MopAutoWashFrequencyEvent(expected_interval)]
+    )
 
 
 @pytest.mark.docker
